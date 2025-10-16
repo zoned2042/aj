@@ -8,7 +8,18 @@ local TeleportService = game:GetService("TeleportService")
 local Players = game:GetService("Players")
 
 local req = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
-if not req then warn("[Vault] No compatible request() in this executor") return end
+-- safe HTTP wrapper: opens UI even if request() isn't available; GET uses HttpGet fallback
+local function http_call(params)
+  if req then
+    return req(params)
+  else
+    if (params.Method == "GET" or not params.Method) and params.Url then
+      local ok, body = pcall(function() return game:HttpGet(params.Url) end)
+      if ok then return { StatusCode = 200, Body = body } end
+    end
+    return { StatusCode = 0, Body = "" }
+  end
+end
 
 local API = "http://127.0.0.1:5000"
 local TITLE = "Vault Autojoiner"
@@ -28,12 +39,27 @@ local function jsonDecode(s)
 end
 
 local function pollNext()
-  local ok, res = pcall(function() return req({Url = API.."/next", Method = "POST"}) end)
+  local ok, res = pcall(function() return http_call({Url = API.."/next", Method = "POST"}) end)
   if not ok or not res then return nil end
-  if res.StatusCode ~= 200 and res.StatusCode ~= 201 then return nil end
+  if res.StatusCode ~= 200 and res.StatusCode ~= 201 then
+    -- try text fallback endpoint if available
+    local ok2, res2 = pcall(function() return http_call({Url = API.."/next_text", Method = "GET"}) end)
+    if ok2 and res2 and res2.StatusCode == 200 and res2.Body and #res2.Body > 5 then
+      return tostring(res2.Body), nil
+    end
+    return nil
+  end
   local data = jsonDecode(res.Body or "")
   if data and data.ok and data.server and data.server.job_id then
     return tostring(data.server.job_id), data.server.join_script
+  end
+  return nil
+end
+
+local function turboNextText()
+  local ok, res = pcall(function() return http_call({Url = API.."/next_text", Method = "GET"}) end)
+  if ok and res and res.StatusCode == 200 and res.Body and #res.Body > 5 then
+    return tostring(res.Body)
   end
   return nil
 end
@@ -44,13 +70,43 @@ local function teleport(jobId, placeId)
   TeleportService:TeleportToPlaceInstance(pid, jobId, Players.LocalPlayer)
 end
 
--- Minimal UI (executor-native), avoid heavy libraries
--- Keybinds similar to examples: [R]=Config placeholder, [T]=Auto toggle, [H]=Invite overlay
+-- Turbo path that respects current blacklist: if any blacklist is on, prefer POST /next
+local function turboGetJobId()
+  local hasBl=false
+  for _,on in pairs(state.blacklist) do if on then hasBl=true break end end
+  if hasBl then
+    local jid = nil
+    local ok,res = pcall(function()
+      local bl={}; for k,v in pairs(state.blacklist) do if v then table.insert(bl,k) end end
+      local json = HttpService:JSONEncode({ blacklist = bl })
+      return http_call({ Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json })
+    end)
+    if ok and res and (res.StatusCode==200 or res.StatusCode==201) and res.Body then local d=jsonDecode(res.Body); if d and d.ok and d.server and d.server.job_id then jid=tostring(d.server.job_id) end end
+    return jid or pollNext()
+  else
+    return turboNextText() or pollNext()
+  end
+end
+
+-- Minimal UI (executor-native), avoid heavy libraries; pcall sections for robustness
+-- Keybinds: [T]=Auto toggle, [H]=Invi toggle, [I]=Copy invite, [J]=Quick join
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "VaultJoinerUI"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local function protect_gui(gui)
+  pcall(function()
+    if syn and syn.protect_gui then syn.protect_gui(gui) end
+  end)
+  local parent = (gethui and gethui())
+    or (get_hidden_gui and get_hidden_gui())
+    or (game:FindFirstChildOfClass("CoreGui"))
+    or game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+    or game:GetService("StarterGui")
+  gui.Parent = parent
+end
 
 local green = Color3.fromRGB(24,164,99)
 local red = Color3.fromRGB(196,62,62)
@@ -94,8 +150,8 @@ RunningDot.Position = UDim2.new(1, -130, 0, 0)
 RunningDot.Font = Enum.Font.Gotham
 RunningDot.TextSize = 14
 RunningDot.TextXAlignment = Enum.TextXAlignment.Right
-RunningDot.TextColor3 = green
-RunningDot.Text = "+ RUNNING"
+RunningDot.TextColor3 = Color3.fromRGB(130,130,130)
+RunningDot.Text = "+ IDLE"
 RunningDot.Parent = Header
 
 local Body = Instance.new("Frame")
@@ -134,8 +190,9 @@ local function makeBtn(parent, text, bg, pos)
   return b
 end
 
-local runningBtn = makeBtn(Left, "RUNNING", green, UDim2.new(0, 16, 0, 16))
+local runningBtn = makeBtn(Left, "START", green, UDim2.new(0, 16, 0, 16))
 local stopBtn = makeBtn(Left, "STOP", red, UDim2.new(0, 146, 0, 16))
+local turboBtn = makeBtn(Left, "TURBO [J]", Color3.fromRGB(200,120,60), UDim2.new(0, 16, 0, 170))
 
 local autoLabel = Instance.new("TextLabel")
 autoLabel.BackgroundTransparency = 1
@@ -159,56 +216,88 @@ blacklistLabel.TextXAlignment = Enum.TextXAlignment.Left
 blacklistLabel.Text = "BLACKLIST"
 blacklistLabel.Parent = Left
 
+local blToggle = makeBtn(Left, "BLACKLIST ON", green, UDim2.new(0, 16, 0, 126))
+
+local inviBtn = makeBtn(Left, "INVI: OFF [H]", Color3.fromRGB(68,114,196), UDim2.new(0, 16, 0, 214))
+
+-- Brainrot blacklist box
+local blListLabel = Instance.new("TextLabel")
+blListLabel.BackgroundTransparency = 1
+blListLabel.Position = UDim2.new(0, 16, 0, 254)
+blListLabel.Size = UDim2.new(0, 240, 0, 20)
+blListLabel.Font = Enum.Font.Gotham
+blListLabel.TextSize = 14
+blListLabel.TextColor3 = Color3.fromRGB(200,200,200)
+blListLabel.TextXAlignment = Enum.TextXAlignment.Left
+blListLabel.Text = "BRAINROT BLACKLIST"
+blListLabel.Parent = Left
+
+-- Input box + ADD + PURGE
 local blInput = Instance.new("TextBox")
-blInput.Size = UDim2.new(0, 150, 0, 32)
-blInput.Position = UDim2.new(0, 16, 0, 126)
+blInput.Position = UDim2.new(0, 16, 0, 278)
+blInput.Size = UDim2.new(0, 160, 0, 28)
 blInput.BackgroundColor3 = gray3
 blInput.BorderSizePixel = 0
+blInput.ClearTextOnFocus = false
+blInput.PlaceholderText = "add term..."
 blInput.Text = ""
-blInput.PlaceholderText = "Pet name..."
-blInput.TextColor3 = Color3.fromRGB(240,240,240)
+blInput.TextColor3 = Color3.fromRGB(230,230,230)
 blInput.Font = Enum.Font.Gotham
 blInput.TextSize = 14
 blInput.Parent = Left
 
-local blAdd = makeBtn(Left, "ADD", Color3.fromRGB(180,50,50), UDim2.new(0, 176, 0, 126))
+local blAddBtn = makeBtn(Left, "ADD", Color3.fromRGB(90,140,220), UDim2.new(0, 182, 0, 278))
+blAddBtn.Size = UDim2.new(0, 74, 0, 28)
 
-local blToggle = makeBtn(Left, "BLACKLIST ON", green, UDim2.new(0, 16, 0, 170))
+local purgeBtn = makeBtn(Left, "PURGE BLACKLISTED", Color3.fromRGB(120,60,60), UDim2.new(0, 16, 0, 318))
+purgeBtn.Size = UDim2.new(0, 240, 0, 28)
 
-local inviBtn = makeBtn(Left, "Inví [H]", Color3.fromRGB(68,114,196), UDim2.new(0, 16, 0, 214))
+local blChipScroll = Instance.new("ScrollingFrame")
+blChipScroll.Position = UDim2.new(0, 16, 0, 354)
+blChipScroll.Size = UDim2.new(0, 240, 0, 54)
+blChipScroll.BackgroundColor3 = gray3
+blChipScroll.BorderSizePixel = 0
+blChipScroll.ScrollBarThickness = 6
+blChipScroll.CanvasSize = UDim2.new(0,0,0,0)
+blChipScroll.Parent = Left
+local blChipLayout = Instance.new("UIListLayout")
+blChipLayout.Padding = UDim.new(0, 6)
+blChipLayout.FillDirection = Enum.FillDirection.Vertical
+blChipLayout.SortOrder = Enum.SortOrder.LayoutOrder
+blChipLayout.Parent = blChipScroll
 
--- Luarmor loader controls
-local keyLabel = Instance.new("TextLabel")
-keyLabel.BackgroundTransparency = 1
-keyLabel.Position = UDim2.new(0, 16, 0, 254)
-keyLabel.Size = UDim2.new(0, 240, 0, 20)
-keyLabel.Font = Enum.Font.Gotham
-keyLabel.TextSize = 14
-keyLabel.TextColor3 = Color3.fromRGB(200,200,200)
-keyLabel.TextXAlignment = Enum.TextXAlignment.Left
-keyLabel.Text = "SCRIPT KEY"
-keyLabel.Parent = Left
+-- Simple tabs: Servers / Multi Pets
+local tabBar = Instance.new("Frame")
+tabBar.BackgroundColor3 = gray
+tabBar.BorderSizePixel = 0
+tabBar.Size = UDim2.new(1, -16, 0, 28)
+tabBar.Position = UDim2.new(0, 8, 0, 8)
+tabBar.Parent = Right
 
-local keyBox = Instance.new("TextBox")
-keyBox.Size = UDim2.new(0, 150, 0, 32)
-keyBox.Position = UDim2.new(0, 16, 0, 278)
-keyBox.BackgroundColor3 = gray3
-keyBox.BorderSizePixel = 0
-keyBox.Text = ""
-keyBox.PlaceholderText = "paste key"
-keyBox.TextColor3 = Color3.fromRGB(240,240,240)
-keyBox.Font = Enum.Font.Gotham
-keyBox.TextSize = 14
-keyBox.Parent = Left
+local function makeTab(txt, x)
+  local b = Instance.new("TextButton")
+  b.Size = UDim2.new(0, 110, 0, 28)
+  b.Position = UDim2.new(0, x, 0, 0)
+  b.BackgroundColor3 = gray2
+  b.BorderSizePixel = 0
+  b.TextColor3 = Color3.fromRGB(230,230,230)
+  b.Font = Enum.Font.GothamBold
+  b.TextSize = 14
+  b.Text = txt
+  b.AutoButtonColor = true
+  b.Parent = tabBar
+  return b
+end
+local tabBtnServers = makeTab("SERVERS", 0)
+local tabBtnMulti = makeTab("MULTI PETS", 120)
+local currentTab = "servers"
 
-local loadBtn = makeBtn(Left, "LOAD", Color3.fromRGB(50,140,220), UDim2.new(0, 176, 0, 278))
-
--- Right list header
+-- Servers header
 local rowHeader = Instance.new("Frame")
 rowHeader.BackgroundColor3 = gray2
 rowHeader.BorderSizePixel = 0
 rowHeader.Size = UDim2.new(1, -16, 0, 34)
-rowHeader.Position = UDim2.new(0, 8, 0, 84)
+rowHeader.Position = UDim2.new(0, 8, 0, 50)
 rowHeader.Parent = Right
 
 local function headerText(txt, x)
@@ -227,12 +316,13 @@ headerText("PET", 12)
 headerText("MONEY/s", 350)
 headerText("ACTION", 500)
 
--- Multi Pets boxed panel
+-- Multi Pets boxed panel (hidden unless tab is active)
 local mpBox = Instance.new("Frame")
 mpBox.BackgroundColor3 = gray2
 mpBox.BorderSizePixel = 0
-mpBox.Position = UDim2.new(0, 8, 0, 8)
-mpBox.Size = UDim2.new(1, -16, 0, 96)
+mpBox.Position = UDim2.new(0, 8, 0, 50)
+mpBox.Size = UDim2.new(1, -16, 0, 280)
+mpBox.Visible = false
 mpBox.Parent = Right
 
 local mpHeader = Instance.new("TextLabel")
@@ -258,8 +348,8 @@ mpLayout.Padding = UDim.new(0, 2)
 mpLayout.Parent = mpList
 
 local Scroller = Instance.new("ScrollingFrame")
-Scroller.Position = UDim2.new(0, 8, 0, 128)
-Scroller.Size = UDim2.new(1, -16, 1, -60)
+Scroller.Position = UDim2.new(0, 8, 0, 84)
+Scroller.Size = UDim2.new(1, -16, 1, -100)
 Scroller.BackgroundTransparency = 1
 Scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
 Scroller.ScrollBarThickness = 6
@@ -269,22 +359,18 @@ local ListLayout = Instance.new("UIListLayout")
 ListLayout.Padding = UDim.new(0, 8)
 ListLayout.Parent = Scroller
 
--- Invisible base (stealth overlay) toggle
-local invisContainer = Instance.new("Frame")
-invisContainer.Size = UDim2.new(1, 0, 1, 0)
-invisContainer.BackgroundTransparency = 1
-invisContainer.Visible = false
-invisContainer.Parent = ScreenGui
-
-local inviLabel = Instance.new("TextLabel")
-inviLabel.Size = UDim2.new(1, 0, 0, 22)
-inviLabel.Position = UDim2.new(0, 0, 0, 0)
-inviLabel.BackgroundTransparency = 1
-inviLabel.Text = "Stealth overlay active"
-inviLabel.TextColor3 = Color3.fromRGB(180,180,180)
-inviLabel.Font = Enum.Font.Gotham
-inviLabel.TextSize = 14
-inviLabel.Parent = invisContainer
+-- Toast label for feedback
+local toast = Instance.new("TextLabel")
+toast.Size = UDim2.new(1, 0, 0, 22)
+toast.Position = UDim2.new(0, 0, 0, 0)
+toast.BackgroundColor3 = Color3.fromRGB(20,20,20)
+toast.BackgroundTransparency = 0.2
+toast.Visible = false
+toast.Text = "Invite copied to clipboard"
+toast.TextColor3 = Color3.fromRGB(200,200,255)
+toast.Font = Enum.Font.Gotham
+toast.TextSize = 14
+toast.Parent = ScreenGui
 
 local function setRunning(on)
   state.running = on and true or false
@@ -300,6 +386,8 @@ end
 
 local heartbeat
 local _lastPost = 0
+local _blVersion = 0
+local _blJsonCache = "{}"
 local function stop()
   setRunning(false)
   if heartbeat then heartbeat:Disconnect() heartbeat = nil end
@@ -313,13 +401,19 @@ local function start()
     if state.auto then
       -- send blacklist-aware request with a small cooldown to avoid lag
       local nowt = tick()
-      if nowt - _lastPost < 0.35 then return end
+  if nowt - _lastPost < 0.15 then return end
       _lastPost = nowt
       local bl = {}
       for name, on in pairs(state.blacklist) do if on then table.insert(bl, name) end end
-      local json = HttpService:JSONEncode({ blacklist = bl })
+      local json
+      if _blVersion == 0 then
+        json = HttpService:JSONEncode({ blacklist = bl })
+        _blJsonCache = json
+      else
+        json = _blJsonCache
+      end
       local ok, res = pcall(function()
-        return req({Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json })
+        return http_call({Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json })
       end)
       local jid
       if ok and res and (res.StatusCode == 200 or res.StatusCode == 201) and res.Body then
@@ -346,9 +440,88 @@ stopBtn.MouseButton1Click:Connect(function()
   stop()
 end)
 
-inviBtn.MouseButton1Click:Connect(function()
-  invisContainer.Visible = not invisContainer.Visible
+turboBtn.MouseButton1Click:Connect(function()
+  local jid = turboNextText() or pollNext()
+  if jid then teleport(jid) end
 end)
+
+local function setclipboard_any(text)
+  local ok = false
+  if setclipboard then pcall(function() setclipboard(text) end); ok = true end
+  if (not ok) and toclipboard then pcall(function() toclipboard(text) end); ok = true end
+  if (not ok) and set_clipboard then pcall(function() set_clipboard(text) end); ok = true end
+  return ok
+end
+
+local function showToast(msg)
+  toast.Text = msg
+  toast.Visible = true
+  task.delay(1.5, function() toast.Visible = false end)
+end
+
+-- Invi (local base invisibility) toggle
+local invi = { on = false, modified = {} }
+local inviRadius = 80 -- studs around the player
+
+local function _validPart(p, character)
+  if not p or not p.Parent then return false end
+  if not p:IsA("BasePart") then return false end
+  if character and p:IsDescendantOf(character) then return false end
+  return true
+end
+
+local function invi_apply()
+  local plr = Players.LocalPlayer
+  local char = plr and plr.Character
+  local hrp = char and char:FindFirstChild("HumanoidRootPart")
+  if not hrp then return end
+  local params = OverlapParams.new()
+  params.FilterType = Enum.RaycastFilterType.Exclude
+  params.FilterDescendantsInstances = { char }
+  local parts = workspace:GetPartBoundsInRadius(hrp.Position, inviRadius, params)
+  for _, p in ipairs(parts) do
+    if _validPart(p, char) then
+      if p.LocalTransparencyModifier < 0.8 then
+        p.LocalTransparencyModifier = 0.8
+        invi.modified[p] = true
+      end
+    end
+  end
+end
+
+local function invi_clear()
+  for p, _ in pairs(invi.modified) do
+    if typeof(p) == "Instance" and p.Parent and p:IsA("BasePart") then
+  p.LocalTransparencyModifier = 0
+    end
+  end
+  invi.modified = {}
+end
+
+local function toggleInvi()
+  invi.on = not invi.on
+  if invi.on then
+    inviBtn.Text = "INVI: ON  [H]"
+    inviBtn.BackgroundColor3 = Color3.fromRGB(90,160,230)
+    showToast("Invi ON — nearby base hidden")
+    invi_apply()
+  else
+    inviBtn.Text = "INVI: OFF [H]"
+    inviBtn.BackgroundColor3 = Color3.fromRGB(68,114,196)
+    invi_clear()
+    showToast("Invi OFF — base restored")
+  end
+end
+
+-- keep it fresh while ON: periodically apply to newly streamed parts
+task.spawn(function()
+  while true do
+    task.wait(0.75)
+    if invi.on then pcall(invi_apply) end
+  end
+end)
+
+inviBtn.MouseButton1Click:Connect(toggleInvi)
 
 -- Keybinds
 local UIS = game:GetService("UserInputService")
@@ -357,11 +530,16 @@ UIS.InputBegan:Connect(function(input, gp)
   if input.KeyCode == Enum.KeyCode.T then
     setAuto(not state.auto)
   elseif input.KeyCode == Enum.KeyCode.H then
-    invisContainer.Visible = not invisContainer.Visible
+    toggleInvi()
+  elseif input.KeyCode == Enum.KeyCode.Backquote then
+    -- Hide/show entire UI with the backtick/tilde key
+    ScreenGui.Enabled = not ScreenGui.Enabled
+  elseif input.KeyCode == Enum.KeyCode.I then
+    if setclipboard_any(DISCORD) then showToast("Invite copied to clipboard") else showToast("Copy failed; check executor perms") end
   elseif input.KeyCode == Enum.KeyCode.R then
     -- Config placeholder: future settings
   elseif input.KeyCode == Enum.KeyCode.J then
-    local jid = pollNext()
+    local jid = turboGetJobId()
     if jid then teleport(jid) end
   end
 end)
@@ -370,17 +548,15 @@ end)
 local blacklistOn = true
 local blacklist = {}
 local function addBlacklist(name)
-  if not name or #name == 0 then return end
-  blacklist[string.lower(name)] = true
+  if not name then return end
+  name = string.lower((tostring(name) or ""):gsub("^%s+","" ):gsub("%s+$",""))
+  if #name == 0 then return end
+  blacklist[name] = true
 end
 local function inBlacklist(name)
   if not name then return false end
   return blacklist[string.lower(name)] == true
 end
-blAdd.MouseButton1Click:Connect(function()
-  addBlacklist(blInput.Text)
-  blInput.Text = ""
-end)
 blToggle.MouseButton1Click:Connect(function()
   blacklistOn = not blacklistOn
   blToggle.Text = blacklistOn and "BLACKLIST ON" or "BLACKLIST OFF"
@@ -395,9 +571,89 @@ local function rebuildBlacklist()
   for k, v in pairs(blacklist) do
     if v then state.blacklist[k] = true end
   end
+  -- Rebuild cached JSON body for blacklist-aware /next and /purge
+  local bl = {}
+  for k,v in pairs(blacklist) do if v then table.insert(bl, k) end end
+  _blJsonCache = HttpService:JSONEncode({ blacklist = bl })
 end
-blAdd.MouseButton1Click:Connect(function() rebuildBlacklist() end)
 blToggle.MouseButton1Click:Connect(function() rebuildBlacklist() end)
+
+-- Render blacklist chips list
+local function renderBlacklistChips()
+  for _, c in ipairs(blChipScroll:GetChildren()) do
+    if c:IsA("Frame") then c:Destroy() end
+  end
+  local total = 0
+  for name, on in pairs(blacklist) do
+    if on then
+      total = total + 1
+      local chip = Instance.new("Frame")
+      chip.BackgroundColor3 = Color3.fromRGB(60,60,60)
+      chip.BorderSizePixel = 0
+      chip.Size = UDim2.new(1, -6, 0, 24)
+      chip.Parent = blChipScroll
+
+      local lbl = Instance.new("TextLabel")
+      lbl.BackgroundTransparency = 1
+      lbl.Position = UDim2.new(0, 8, 0, 4)
+      lbl.Size = UDim2.new(1, -60, 0, 16)
+      lbl.Font = Enum.Font.Gotham
+      lbl.TextSize = 13
+      lbl.TextXAlignment = Enum.TextXAlignment.Left
+      lbl.TextColor3 = Color3.fromRGB(220,220,220)
+      lbl.Text = name
+      lbl.Parent = chip
+
+      local xBtn = Instance.new("TextButton")
+      xBtn.Size = UDim2.new(0, 24, 0, 20)
+      xBtn.Position = UDim2.new(1, -30, 0, 2)
+      xBtn.BackgroundColor3 = Color3.fromRGB(120,60,60)
+      xBtn.BorderSizePixel = 0
+      xBtn.TextColor3 = Color3.fromRGB(255,255,255)
+      xBtn.Font = Enum.Font.GothamBold
+      xBtn.TextSize = 14
+      xBtn.Text = "X"
+      xBtn.Parent = chip
+      xBtn.MouseButton1Click:Connect(function()
+        blacklist[name] = nil
+        rebuildBlacklist()
+        _blVersion = _blVersion + 1
+        renderBlacklistChips()
+        -- auto-purge removed terms
+        pcall(function() return http_call({ Url = API.."/purge", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = _blJsonCache }) end)
+      end)
+    end
+  end
+  blChipScroll.CanvasSize = UDim2.new(0,0,0, total * 28)
+end
+
+-- Seed defaults to filter random/notify posts
+addBlacklist("brainrot")
+addBlacklist("brain rot")
+addBlacklist("brain-rot")
+addBlacklist("brainrot notify")
+addBlacklist("ajjans hub")
+addBlacklist("high value multi-pet")
+rebuildBlacklist()
+renderBlacklistChips()
+
+-- Add/Purge controls
+blAddBtn.MouseButton1Click:Connect(function()
+  local term = (tostring(blInput.Text or "") or ""):gsub("^%s+",""):gsub("%s+$","")
+  if #term > 0 then
+    addBlacklist(term)
+    blInput.Text = ""
+    rebuildBlacklist()
+    renderBlacklistChips()
+    -- purge on add
+    pcall(function() return http_call({ Url = API.."/purge", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = _blJsonCache }) end)
+  end
+end)
+
+purgeBtn.MouseButton1Click:Connect(function()
+  rebuildBlacklist()
+  pcall(function() return http_call({ Url = API.."/purge", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = _blJsonCache }) end)
+end)
 
 -- Make rows from /servers queue info
 local function makeRow(info)
@@ -464,33 +720,44 @@ local function makeRow(info)
 end
 
 local function refreshList()
-  -- Pull a snapshot of the queue
-  local ok, res = pcall(function() return req({Url = API.."/servers", Method = "GET"}) end)
-  if not ok or not res or res.StatusCode ~= 200 then return end
-  local data = jsonDecode(res.Body or "") or {}
-  local items = data.servers or {}
-  -- Update multi-pets (detailed list)
-  local ok2, res2 = pcall(function() return req({Url = API.."/multipets_detail", Method = "GET"}) end)
-  if ok2 and res2 and res2.StatusCode == 200 then
+  -- servers snapshot
+  local ok, res = pcall(function() return http_call({Url = API.."/servers", Method = "GET"}) end)
+  if ok and res and res.StatusCode == 200 then
+    local data = jsonDecode(res.Body or "") or {}
+    local items = data.servers or {}
+    if currentTab == "servers" then
+      for _, child in ipairs(Scroller:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+      end
+      local count = 0
+      for _, info in ipairs(items) do
+        local nm = tostring(info.pet_name or "")
+        if not (blacklistOn and inBlacklist(nm)) and (not string.find(string.lower(nm), "brainrot notify")) then
+          local row = makeRow(info)
+          row.Parent = Scroller
+          count += 1
+        end
+      end
+      Scroller.CanvasSize = UDim2.new(0, 0, 0, count * (40 + 8))
+    end
+  end
+  -- multi pets bullets
+  local ok2, res2 = pcall(function() return http_call({Url = API.."/multipets_detail", Method = "GET"}) end)
+  if ok2 and res2 and res2.StatusCode == 200 and currentTab == "multi" then
     local d2 = jsonDecode(res2.Body or "") or {}
     if d2.items then
       for _, child in ipairs(mpList:GetChildren()) do if child:IsA("TextLabel") then child:Destroy() end end
       local shown = 0
-      for i, it in ipairs(d2.items) do
-        if shown >= 4 then break end
+      for _, it in ipairs(d2.items) do
+        if shown >= 10 then break end
         local name = tostring(it.name or "Unknown")
         local v = tonumber(it.value or 0) or 0
-        local vs
-        if v > 0 then
-          vs = "$"..string.format("%.1f", v/1e6).."M/s"
-        else
-          vs = "--"
-        end
+        local vs = v > 0 and ("$"..string.format("%.1f", v/1e6).."M/s") or "--"
         local l = Instance.new("TextLabel")
         l.BackgroundTransparency = 1
-        l.Size = UDim2.new(1, 0, 0, 16)
+        l.Size = UDim2.new(1, 0, 0, 18)
         l.Font = Enum.Font.Gotham
-        l.TextSize = 13
+        l.TextSize = 14
         l.TextXAlignment = Enum.TextXAlignment.Left
         l.TextColor3 = Color3.fromRGB(190,190,190)
         l.Text = "•  "..name.."  –  "..vs
@@ -499,46 +766,39 @@ local function refreshList()
       end
     end
   end
-  -- clear
-  for _, child in ipairs(Scroller:GetChildren()) do
-    if child:IsA("Frame") then child:Destroy() end
-  end
-  -- render
-  local count = 0
-  for _, info in ipairs(items) do
-    if not (blacklistOn and inBlacklist(info.pet_name)) then
-      local row = makeRow(info)
-      row.Parent = Scroller
-      count += 1
-    end
-  end
-  Scroller.CanvasSize = UDim2.new(0, 0, 0, count * (40 + 8))
 end
 
 -- periodic UI refresh
+local function showServersTab()
+  currentTab = "servers"
+  rowHeader.Visible = true
+  Scroller.Visible = true
+  mpBox.Visible = false
+  refreshList()
+end
+local function showMultiTab()
+  currentTab = "multi"
+  rowHeader.Visible = false
+  Scroller.Visible = false
+  mpBox.Visible = true
+  refreshList()
+end
+tabBtnServers.MouseButton1Click:Connect(showServersTab)
+tabBtnMulti.MouseButton1Click:Connect(showMultiTab)
+
 task.spawn(function()
   while true do
-    task.wait(0.5)
+    task.wait(1.0)
     refreshList()
   end
 end)
 
-ScreenGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+protect_gui(ScreenGui)
 
 -- Start idle; user can click RUNNING then toggle Auto
 setRunning(false)
 setAuto(false)
+showServersTab()
 
--- Loader button behavior
-loadBtn.MouseButton1Click:Connect(function()
-  local key = keyBox.Text
-  if key and #key > 0 then
-    getgenv().script_key = key
-  else
-    getgenv().script_key = "RBflfCzTSOZXPhcjnlzPWMAmgdMAcKRp"
-  end
-  local ok, err = pcall(function()
-    loadstring(game:HttpGet("https://api.luarmor.net/files/v3/loaders/5896f91b3735956f3d9d0727b84fcbe5.lua"))()
-  end)
-  if not ok then warn("[Vault] loader error: "..tostring(err)) end
-end)
+-- Loader removed: using native UI only; blacklist box replaces loader section
+
