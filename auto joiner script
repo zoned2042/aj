@@ -1,0 +1,544 @@
+-- Vault Autojoiner (Wave/Volcano compatible)
+-- UI: Running/Stop buttons, Auto toggle, Invite button (no Lock)
+-- Pulls JobIds from local API: /next and /status
+-- Load from executor: loadstring(game:HttpGet("http://127.0.0.1:5000/ui.lua"))()
+
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+
+local req = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
+if not req then warn("[Vault] No compatible request() in this executor") return end
+
+local API = "http://127.0.0.1:5000"
+local TITLE = "Vault Autojoiner"
+local DISCORD = "https://discord.gg/cq29atkGA6" -- replace with your invite if desired
+
+local state = {
+  running = false,
+  auto = false,
+  lastJob = "",
+  blacklist = {},
+}
+
+local function jsonDecode(s)
+  local ok, data = pcall(function() return HttpService:JSONDecode(s) end)
+  if ok then return data end
+  return nil
+end
+
+local function pollNext()
+  local ok, res = pcall(function() return req({Url = API.."/next", Method = "POST"}) end)
+  if not ok or not res then return nil end
+  if res.StatusCode ~= 200 and res.StatusCode ~= 201 then return nil end
+  local data = jsonDecode(res.Body or "")
+  if data and data.ok and data.server and data.server.job_id then
+    return tostring(data.server.job_id), data.server.join_script
+  end
+  return nil
+end
+
+local function teleport(jobId, placeId)
+  if not jobId or #jobId == 0 then return end
+  local pid = placeId or game.PlaceId
+  TeleportService:TeleportToPlaceInstance(pid, jobId, Players.LocalPlayer)
+end
+
+-- Minimal UI (executor-native), avoid heavy libraries
+-- Keybinds similar to examples: [R]=Config placeholder, [T]=Auto toggle, [H]=Invite overlay
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "VaultJoinerUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local green = Color3.fromRGB(24,164,99)
+local red = Color3.fromRGB(196,62,62)
+local gray = Color3.fromRGB(28,28,28)
+local gray2 = Color3.fromRGB(40,40,40)
+local gray3 = Color3.fromRGB(52,52,52)
+local accent = Color3.fromRGB(30,180,140)
+local orange = Color3.fromRGB(214,130,46)
+
+-- Root floating panel like screenshot
+local Root = Instance.new("Frame")
+Root.Size = UDim2.new(0, 780, 0, 380)
+Root.Position = UDim2.new(0.5, -390, 0.5, -190)
+Root.BackgroundColor3 = gray
+Root.BorderSizePixel = 0
+Root.Active = true
+Root.Draggable = true
+Root.Parent = ScreenGui
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 44)
+Header.BackgroundColor3 = gray2
+Header.BorderSizePixel = 0
+Header.Parent = Root
+
+local Title = Instance.new("TextLabel")
+Title.BackgroundTransparency = 1
+Title.Position = UDim2.new(0, 14, 0, 8)
+Title.Size = UDim2.new(1, -28, 0, 28)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 18
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.TextColor3 = Color3.fromRGB(230,230,230)
+Title.Text = "Auto Joiner | Vault"
+Title.Parent = Header
+
+local RunningDot = Instance.new("TextLabel")
+RunningDot.BackgroundTransparency = 1
+RunningDot.Size = UDim2.new(0, 120, 1, 0)
+RunningDot.Position = UDim2.new(1, -130, 0, 0)
+RunningDot.Font = Enum.Font.Gotham
+RunningDot.TextSize = 14
+RunningDot.TextXAlignment = Enum.TextXAlignment.Right
+RunningDot.TextColor3 = green
+RunningDot.Text = "+ RUNNING"
+RunningDot.Parent = Header
+
+local Body = Instance.new("Frame")
+Body.BackgroundColor3 = gray
+Body.BorderSizePixel = 0
+Body.Position = UDim2.new(0, 0, 0, 44)
+Body.Size = UDim2.new(1, 0, 1, -44)
+Body.Parent = Root
+
+local Left = Instance.new("Frame")
+Left.BackgroundColor3 = gray
+Left.BorderSizePixel = 0
+Left.Position = UDim2.new(0, 0, 0, 0)
+Left.Size = UDim2.new(0, 270, 1, 0)
+Left.Parent = Body
+
+local Right = Instance.new("Frame")
+Right.BackgroundColor3 = gray
+Right.BorderSizePixel = 0
+Right.Position = UDim2.new(0, 270, 0, 0)
+Right.Size = UDim2.new(1, -270, 1, 0)
+Right.Parent = Body
+
+local function makeBtn(parent, text, bg, pos)
+  local b = Instance.new("TextButton")
+  b.Size = UDim2.new(0, 120, 0, 36)
+  b.Position = pos
+  b.BackgroundColor3 = bg
+  b.BorderSizePixel = 0
+  b.TextColor3 = Color3.fromRGB(255,255,255)
+  b.Font = Enum.Font.GothamBold
+  b.TextSize = 14
+  b.Text = text
+  b.AutoButtonColor = true
+  b.Parent = parent
+  return b
+end
+
+local runningBtn = makeBtn(Left, "RUNNING", green, UDim2.new(0, 16, 0, 16))
+local stopBtn = makeBtn(Left, "STOP", red, UDim2.new(0, 146, 0, 16))
+
+local autoLabel = Instance.new("TextLabel")
+autoLabel.BackgroundTransparency = 1
+autoLabel.Position = UDim2.new(0, 16, 0, 66)
+autoLabel.Size = UDim2.new(0, 240, 0, 24)
+autoLabel.Font = Enum.Font.Gotham
+autoLabel.TextSize = 14
+autoLabel.TextColor3 = Color3.fromRGB(210,210,210)
+autoLabel.TextXAlignment = Enum.TextXAlignment.Left
+autoLabel.Text = "AUTO JOIN: OFF"
+autoLabel.Parent = Left
+
+local blacklistLabel = Instance.new("TextLabel")
+blacklistLabel.BackgroundTransparency = 1
+blacklistLabel.Position = UDim2.new(0, 16, 0, 102)
+blacklistLabel.Size = UDim2.new(0, 240, 0, 20)
+blacklistLabel.Font = Enum.Font.Gotham
+blacklistLabel.TextSize = 14
+blacklistLabel.TextColor3 = Color3.fromRGB(200,200,200)
+blacklistLabel.TextXAlignment = Enum.TextXAlignment.Left
+blacklistLabel.Text = "BLACKLIST"
+blacklistLabel.Parent = Left
+
+local blInput = Instance.new("TextBox")
+blInput.Size = UDim2.new(0, 150, 0, 32)
+blInput.Position = UDim2.new(0, 16, 0, 126)
+blInput.BackgroundColor3 = gray3
+blInput.BorderSizePixel = 0
+blInput.Text = ""
+blInput.PlaceholderText = "Pet name..."
+blInput.TextColor3 = Color3.fromRGB(240,240,240)
+blInput.Font = Enum.Font.Gotham
+blInput.TextSize = 14
+blInput.Parent = Left
+
+local blAdd = makeBtn(Left, "ADD", Color3.fromRGB(180,50,50), UDim2.new(0, 176, 0, 126))
+
+local blToggle = makeBtn(Left, "BLACKLIST ON", green, UDim2.new(0, 16, 0, 170))
+
+local inviBtn = makeBtn(Left, "Inví [H]", Color3.fromRGB(68,114,196), UDim2.new(0, 16, 0, 214))
+
+-- Luarmor loader controls
+local keyLabel = Instance.new("TextLabel")
+keyLabel.BackgroundTransparency = 1
+keyLabel.Position = UDim2.new(0, 16, 0, 254)
+keyLabel.Size = UDim2.new(0, 240, 0, 20)
+keyLabel.Font = Enum.Font.Gotham
+keyLabel.TextSize = 14
+keyLabel.TextColor3 = Color3.fromRGB(200,200,200)
+keyLabel.TextXAlignment = Enum.TextXAlignment.Left
+keyLabel.Text = "SCRIPT KEY"
+keyLabel.Parent = Left
+
+local keyBox = Instance.new("TextBox")
+keyBox.Size = UDim2.new(0, 150, 0, 32)
+keyBox.Position = UDim2.new(0, 16, 0, 278)
+keyBox.BackgroundColor3 = gray3
+keyBox.BorderSizePixel = 0
+keyBox.Text = ""
+keyBox.PlaceholderText = "paste key"
+keyBox.TextColor3 = Color3.fromRGB(240,240,240)
+keyBox.Font = Enum.Font.Gotham
+keyBox.TextSize = 14
+keyBox.Parent = Left
+
+local loadBtn = makeBtn(Left, "LOAD", Color3.fromRGB(50,140,220), UDim2.new(0, 176, 0, 278))
+
+-- Right list header
+local rowHeader = Instance.new("Frame")
+rowHeader.BackgroundColor3 = gray2
+rowHeader.BorderSizePixel = 0
+rowHeader.Size = UDim2.new(1, -16, 0, 34)
+rowHeader.Position = UDim2.new(0, 8, 0, 84)
+rowHeader.Parent = Right
+
+local function headerText(txt, x)
+  local l = Instance.new("TextLabel")
+  l.BackgroundTransparency = 1
+  l.Position = UDim2.new(0, x, 0, 7)
+  l.Size = UDim2.new(0, 160, 0, 20)
+  l.Font = Enum.Font.GothamBold
+  l.TextSize = 14
+  l.TextColor3 = Color3.fromRGB(220,220,220)
+  l.TextXAlignment = Enum.TextXAlignment.Left
+  l.Text = txt
+  l.Parent = rowHeader
+end
+headerText("PET", 12)
+headerText("MONEY/s", 350)
+headerText("ACTION", 500)
+
+-- Multi Pets boxed panel
+local mpBox = Instance.new("Frame")
+mpBox.BackgroundColor3 = gray2
+mpBox.BorderSizePixel = 0
+mpBox.Position = UDim2.new(0, 8, 0, 8)
+mpBox.Size = UDim2.new(1, -16, 0, 96)
+mpBox.Parent = Right
+
+local mpHeader = Instance.new("TextLabel")
+mpHeader.BackgroundTransparency = 1
+mpHeader.Position = UDim2.new(0, 8, 0, 6)
+mpHeader.Size = UDim2.new(1, -16, 0, 16)
+mpHeader.Font = Enum.Font.GothamBold
+mpHeader.TextSize = 14
+mpHeader.TextXAlignment = Enum.TextXAlignment.Left
+mpHeader.TextColor3 = Color3.fromRGB(210,210,210)
+mpHeader.Text = "MULTI PET"
+mpHeader.Parent = mpBox
+
+local mpList = Instance.new("Frame")
+mpList.BackgroundTransparency = 1
+mpList.Position = UDim2.new(0, 8, 0, 26)
+mpList.Size = UDim2.new(1, -16, 0, 64)
+mpList.Parent = mpBox
+local mpLayout = Instance.new("UIListLayout")
+mpLayout.FillDirection = Enum.FillDirection.Vertical
+mpLayout.SortOrder = Enum.SortOrder.LayoutOrder
+mpLayout.Padding = UDim.new(0, 2)
+mpLayout.Parent = mpList
+
+local Scroller = Instance.new("ScrollingFrame")
+Scroller.Position = UDim2.new(0, 8, 0, 128)
+Scroller.Size = UDim2.new(1, -16, 1, -60)
+Scroller.BackgroundTransparency = 1
+Scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+Scroller.ScrollBarThickness = 6
+Scroller.Parent = Right
+
+local ListLayout = Instance.new("UIListLayout")
+ListLayout.Padding = UDim.new(0, 8)
+ListLayout.Parent = Scroller
+
+-- Invisible base (stealth overlay) toggle
+local invisContainer = Instance.new("Frame")
+invisContainer.Size = UDim2.new(1, 0, 1, 0)
+invisContainer.BackgroundTransparency = 1
+invisContainer.Visible = false
+invisContainer.Parent = ScreenGui
+
+local inviLabel = Instance.new("TextLabel")
+inviLabel.Size = UDim2.new(1, 0, 0, 22)
+inviLabel.Position = UDim2.new(0, 0, 0, 0)
+inviLabel.BackgroundTransparency = 1
+inviLabel.Text = "Stealth overlay active"
+inviLabel.TextColor3 = Color3.fromRGB(180,180,180)
+inviLabel.Font = Enum.Font.Gotham
+inviLabel.TextSize = 14
+inviLabel.Parent = invisContainer
+
+local function setRunning(on)
+  state.running = on and true or false
+  runningBtn.BackgroundColor3 = on and green or Color3.fromRGB(90,90,90)
+  RunningDot.TextColor3 = on and green or Color3.fromRGB(130,130,130)
+  RunningDot.Text = on and "+ RUNNING" or "+ IDLE"
+end
+
+local function setAuto(on)
+  state.auto = on and true or false
+  autoLabel.Text = on and "AUTO JOIN: ON" or "AUTO JOIN: OFF"
+end
+
+local heartbeat
+local _lastPost = 0
+local function stop()
+  setRunning(false)
+  if heartbeat then heartbeat:Disconnect() heartbeat = nil end
+end
+
+local function start()
+  if state.running then return end
+  setRunning(true)
+  heartbeat = game:GetService("RunService").Heartbeat:Connect(function()
+    if not state.running then return end
+    if state.auto then
+      -- send blacklist-aware request with a small cooldown to avoid lag
+      local nowt = tick()
+      if nowt - _lastPost < 0.35 then return end
+      _lastPost = nowt
+      local bl = {}
+      for name, on in pairs(state.blacklist) do if on then table.insert(bl, name) end end
+      local json = HttpService:JSONEncode({ blacklist = bl })
+      local ok, res = pcall(function()
+        return req({Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json })
+      end)
+      local jid
+      if ok and res and (res.StatusCode == 200 or res.StatusCode == 201) and res.Body then
+        local data = jsonDecode(res.Body)
+        if data and data.ok and data.server and data.server.job_id then
+          jid = tostring(data.server.job_id)
+        end
+      end
+      if jid and jid ~= state.lastJob then
+        state.lastJob = jid
+        teleport(jid)
+      end
+    end
+  end)
+end
+
+runningBtn.MouseButton1Click:Connect(function()
+  setAuto(true)
+  start()
+end)
+
+stopBtn.MouseButton1Click:Connect(function()
+  setAuto(false)
+  stop()
+end)
+
+inviBtn.MouseButton1Click:Connect(function()
+  invisContainer.Visible = not invisContainer.Visible
+end)
+
+-- Keybinds
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input, gp)
+  if gp then return end
+  if input.KeyCode == Enum.KeyCode.T then
+    setAuto(not state.auto)
+  elseif input.KeyCode == Enum.KeyCode.H then
+    invisContainer.Visible = not invisContainer.Visible
+  elseif input.KeyCode == Enum.KeyCode.R then
+    -- Config placeholder: future settings
+  elseif input.KeyCode == Enum.KeyCode.J then
+    local jid = pollNext()
+    if jid then teleport(jid) end
+  end
+end)
+
+-- blacklist feature (client-side)
+local blacklistOn = true
+local blacklist = {}
+local function addBlacklist(name)
+  if not name or #name == 0 then return end
+  blacklist[string.lower(name)] = true
+end
+local function inBlacklist(name)
+  if not name then return false end
+  return blacklist[string.lower(name)] == true
+end
+blAdd.MouseButton1Click:Connect(function()
+  addBlacklist(blInput.Text)
+  blInput.Text = ""
+end)
+blToggle.MouseButton1Click:Connect(function()
+  blacklistOn = not blacklistOn
+  blToggle.Text = blacklistOn and "BLACKLIST ON" or "BLACKLIST OFF"
+  blToggle.BackgroundColor3 = blacklistOn and green or Color3.fromRGB(120,120,120)
+end)
+
+-- Update local state.blacklist whenever user adds entries
+local function rebuildBlacklist()
+  state.blacklist = {}
+  -- For simplicity we keep a set mirror; we'll only add via UI add button
+  -- Existing entries live in the dictionary 'blacklist'
+  for k, v in pairs(blacklist) do
+    if v then state.blacklist[k] = true end
+  end
+end
+blAdd.MouseButton1Click:Connect(function() rebuildBlacklist() end)
+blToggle.MouseButton1Click:Connect(function() rebuildBlacklist() end)
+
+-- Make rows from /servers queue info
+local function makeRow(info)
+  local row = Instance.new("Frame")
+  row.BackgroundColor3 = gray2
+  row.BorderSizePixel = 0
+  row.Size = UDim2.new(1, -10, 0, 40)
+
+  local pet = Instance.new("TextLabel")
+  pet.BackgroundTransparency = 1
+  pet.Position = UDim2.new(0, 10, 0, 10)
+  pet.Size = UDim2.new(0, 320, 0, 20)
+  pet.Font = Enum.Font.Gotham
+  pet.TextSize = 14
+  pet.TextColor3 = Color3.fromRGB(230,230,230)
+  pet.TextXAlignment = Enum.TextXAlignment.Left
+  pet.Text = tostring(info.pet_name or "Unknown")
+  pet.Parent = row
+
+  -- Players column removed per request
+
+  local money = Instance.new("TextLabel")
+  money.BackgroundTransparency = 1
+  money.Position = UDim2.new(0, 350, 0, 10)
+  money.Size = UDim2.new(0, 100, 0, 20)
+  money.Font = Enum.Font.GothamBold
+  money.TextSize = 14
+  money.TextColor3 = Color3.fromRGB(50,220,140)
+  local v = tonumber(info.value or 0) or 0
+  if v > 0 then
+    money.Text = string.format("$%.1fM/s", v/1e6)
+  else
+    money.Text = "--"
+  end
+  money.Parent = row
+
+  local join = Instance.new("TextButton")
+  join.Size = UDim2.new(0, 90, 0, 28)
+  join.Position = UDim2.new(0, 500, 0, 6)
+  join.BackgroundColor3 = Color3.fromRGB(200,60,60)
+  join.BorderSizePixel = 0
+  join.TextColor3 = Color3.fromRGB(255,255,255)
+  join.Font = Enum.Font.GothamBold
+  join.TextSize = 14
+  join.Text = "JOIN"
+  join.Parent = row
+  join.MouseButton1Click:Connect(function()
+    teleport(tostring(info.job_id or ""))
+  end)
+
+  -- double-click row to join quickly
+  local lastClick = 0
+  row.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+      local now = tick()
+      if now - lastClick < 0.25 then
+        teleport(tostring(info.job_id or ""))
+      end
+      lastClick = now
+    end
+  end)
+
+  return row
+end
+
+local function refreshList()
+  -- Pull a snapshot of the queue
+  local ok, res = pcall(function() return req({Url = API.."/servers", Method = "GET"}) end)
+  if not ok or not res or res.StatusCode ~= 200 then return end
+  local data = jsonDecode(res.Body or "") or {}
+  local items = data.servers or {}
+  -- Update multi-pets (detailed list)
+  local ok2, res2 = pcall(function() return req({Url = API.."/multipets_detail", Method = "GET"}) end)
+  if ok2 and res2 and res2.StatusCode == 200 then
+    local d2 = jsonDecode(res2.Body or "") or {}
+    if d2.items then
+      for _, child in ipairs(mpList:GetChildren()) do if child:IsA("TextLabel") then child:Destroy() end end
+      local shown = 0
+      for i, it in ipairs(d2.items) do
+        if shown >= 4 then break end
+        local name = tostring(it.name or "Unknown")
+        local v = tonumber(it.value or 0) or 0
+        local vs
+        if v > 0 then
+          vs = "$"..string.format("%.1f", v/1e6).."M/s"
+        else
+          vs = "--"
+        end
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Size = UDim2.new(1, 0, 0, 16)
+        l.Font = Enum.Font.Gotham
+        l.TextSize = 13
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextColor3 = Color3.fromRGB(190,190,190)
+        l.Text = "•  "..name.."  –  "..vs
+        l.Parent = mpList
+        shown = shown + 1
+      end
+    end
+  end
+  -- clear
+  for _, child in ipairs(Scroller:GetChildren()) do
+    if child:IsA("Frame") then child:Destroy() end
+  end
+  -- render
+  local count = 0
+  for _, info in ipairs(items) do
+    if not (blacklistOn and inBlacklist(info.pet_name)) then
+      local row = makeRow(info)
+      row.Parent = Scroller
+      count += 1
+    end
+  end
+  Scroller.CanvasSize = UDim2.new(0, 0, 0, count * (40 + 8))
+end
+
+-- periodic UI refresh
+task.spawn(function()
+  while true do
+    task.wait(0.5)
+    refreshList()
+  end
+end)
+
+ScreenGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+-- Start idle; user can click RUNNING then toggle Auto
+setRunning(false)
+setAuto(false)
+
+-- Loader button behavior
+loadBtn.MouseButton1Click:Connect(function()
+  local key = keyBox.Text
+  if key and #key > 0 then
+    getgenv().script_key = key
+  else
+    getgenv().script_key = "RBflfCzTSOZXPhcjnlzPWMAmgdMAcKRp"
+  end
+  local ok, err = pcall(function()
+    loadstring(game:HttpGet("https://api.luarmor.net/files/v3/loaders/5896f91b3735956f3d9d0727b84fcbe5.lua"))()
+  end)
+  if not ok then warn("[Vault] loader error: "..tostring(err)) end
+end)
