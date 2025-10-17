@@ -801,4 +801,3 @@ setAuto(false)
 showServersTab()
 
 -- Loader removed: using native UI only; blacklist box replaces loader section
-
