@@ -62,14 +62,15 @@ end
 local function parseJoinScript(js)
   if type(js) ~= "string" or #js == 0 then return nil, nil end
   -- Pattern: TeleportService:TeleportToPlaceInstance(123456, "guid")
-  local pid, jid = js:match("TeleportToPlaceInstance%(%s*(%d+)%s*,%s*[%"']([0-9A-Fa-f%-]+)[%"']")
+  -- Use long-bracket strings to avoid escaping issues in some executors.
+  local pid, jid = js:match([[TeleportToPlaceInstance%(%s*(%d+)%s*,%s*["']([0-9A-Fa-f%-]+)["']]])
   if not pid or not jid then
     -- Fallback: placeId=12345 ... jobId="..."
-    pid, jid = js:match("placeId%s*=%s*(%d+).-[jJ]ob[Ii]d%s*=%s*[%"']([0-9A-Fa-f%-]+)[%"']")
+    pid, jid = js:match([[placeId%s*=%s*(%d+).-[jJ]ob[Ii]d%s*=%s*["']([0-9A-Fa-f%-]+)["']]])
   end
   if not pid or not jid then
     -- Last resort: a number then a GUID-like token in quotes
-    local p2, j2 = js:match("(%d+).-[%"']([0-9A-Fa-f%-]+)[%"']")
+    local p2, j2 = js:match([[ (%d+).-["']([0-9A-Fa-f%-]+)["'] ]])
     if p2 and j2 then pid, jid = p2, j2 end
   end
   local njid = normalizeJobId(jid)
