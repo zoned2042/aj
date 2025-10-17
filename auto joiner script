@@ -30,7 +30,15 @@ local state = {
   auto = false,
   lastJob = "",
   blacklist = {},
+  min_money_raw = 0,
 }
+
+local _min_last = 0
+
+-- Forward declarations for cross-references used before definitions
+local showJoinInfo
+local inBlacklist
+local blacklistOn = true
 
 local function jsonDecode(s)
   local ok, data = pcall(function() return HttpService:JSONDecode(s) end)
@@ -38,20 +46,65 @@ local function jsonDecode(s)
   return nil
 end
 
+-- Normalize and validate a Roblox JobId string
+local function normalizeJobId(id)
+  if not id then return nil end
+  local s = tostring(id)
+  -- strip whitespace and quotes
+  s = s:gsub("[\r\n\t]", " "):gsub("%s+", ""):gsub("^[\'\"]+", ""):gsub("[\'\"]+$", "")
+  if #s < 32 or #s > 64 then return nil end
+  if not s:match("^[0-9a-fA-F%-]+$") then return nil end
+  if not s:find("%-") then return nil end
+  return s
+end
+
+-- Attempt to parse placeId and jobId from a join_script string
+local function parseJoinScript(js)
+  if type(js) ~= "string" or #js == 0 then return nil, nil end
+  -- Pattern: TeleportService:TeleportToPlaceInstance(123456, "guid")
+  local pid, jid = js:match("TeleportToPlaceInstance%(%s*(%d+)%s*,%s*[%"']([0-9A-Fa-f%-]+)[%"']")
+  if not pid or not jid then
+    -- Fallback: placeId=12345 ... jobId="..."
+    pid, jid = js:match("placeId%s*=%s*(%d+).-[jJ]ob[Ii]d%s*=%s*[%"']([0-9A-Fa-f%-]+)[%"']")
+  end
+  if not pid or not jid then
+    -- Last resort: a number then a GUID-like token in quotes
+    local p2, j2 = js:match("(%d+).-[%"']([0-9A-Fa-f%-]+)[%"']")
+    if p2 and j2 then pid, jid = p2, j2 end
+  end
+  local njid = normalizeJobId(jid)
+  local npid = pid and tonumber(pid) or nil
+  return njid, npid
+end
+
 local function pollNext()
-  local ok, res = pcall(function() return http_call({Url = API.."/next", Method = "POST"}) end)
+  -- include blacklist and money filter in POST
+  local bl = {}
+  for name,on in pairs(state.blacklist) do if on then table.insert(bl, name) end end
+  local body = HttpService:JSONEncode({ blacklist = bl, min_money = (tonumber(state.min_money_raw) or 0) * 1000000 })
+  local ok, res = pcall(function() return http_call({Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body }) end)
   if not ok or not res then return nil end
   if res.StatusCode ~= 200 and res.StatusCode ~= 201 then
     -- try text fallback endpoint if available
     local ok2, res2 = pcall(function() return http_call({Url = API.."/next_text", Method = "GET"}) end)
     if ok2 and res2 and res2.StatusCode == 200 and res2.Body and #res2.Body > 5 then
-      return tostring(res2.Body), nil
+      return normalizeJobId(tostring(res2.Body)), nil
     end
     return nil
   end
   local data = jsonDecode(res.Body or "")
-  if data and data.ok and data.server and data.server.job_id then
-    return tostring(data.server.job_id), data.server.join_script
+  if data and data.ok and data.server then
+    local jid, pid = nil, nil
+    if data.server.join_script then
+      jid, pid = parseJoinScript(data.server.join_script)
+    end
+    if not jid and data.server.job_id then
+      jid = normalizeJobId(tostring(data.server.job_id))
+    end
+    if not pid and data.server.place_id then
+      pid = tonumber(data.server.place_id)
+    end
+    if jid then return jid, pid end
   end
   return nil
 end
@@ -59,12 +112,13 @@ end
 local function turboNextText()
   local ok, res = pcall(function() return http_call({Url = API.."/next_text", Method = "GET"}) end)
   if ok and res and res.StatusCode == 200 and res.Body and #res.Body > 5 then
-    return tostring(res.Body)
+    return normalizeJobId(tostring(res.Body))
   end
   return nil
 end
 
 local function teleport(jobId, placeId)
+  jobId = normalizeJobId(jobId)
   if not jobId or #jobId == 0 then return end
   local pid = placeId or game.PlaceId
   TeleportService:TeleportToPlaceInstance(pid, jobId, Players.LocalPlayer)
@@ -74,18 +128,50 @@ end
 local function turboGetJobId()
   local hasBl=false
   for _,on in pairs(state.blacklist) do if on then hasBl=true break end end
-  if hasBl then
-    local jid = nil
-    local ok,res = pcall(function()
-      local bl={}; for k,v in pairs(state.blacklist) do if v then table.insert(bl,k) end end
-      local json = HttpService:JSONEncode({ blacklist = bl })
-      return http_call({ Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json })
-    end)
-    if ok and res and (res.StatusCode==200 or res.StatusCode==201) and res.Body then local d=jsonDecode(res.Body); if d and d.ok and d.server and d.server.job_id then jid=tostring(d.server.job_id) end end
-    return jid or pollNext()
-  else
-    return turboNextText() or pollNext()
+  local minOn = (tonumber(state.min_money_raw) or 0) > 0
+  -- Prefer JSON /next (gives join_script/placeId) for accuracy
+  local bl={}; for k,v in pairs(state.blacklist) do if v then table.insert(bl,k) end end
+  local body = HttpService:JSONEncode({ blacklist = bl, min_money = (tonumber(state.min_money_raw) or 0) * 1000000 })
+  local ok,res = pcall(function()
+    return http_call({ Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+  end)
+  if ok and res and (res.StatusCode==200 or res.StatusCode==201) and res.Body then
+    local d=jsonDecode(res.Body)
+    if d and d.ok and d.server then
+      local jid,pid = parseJoinScript(d.server.join_script or "")
+      if not jid and d.server.job_id then jid = normalizeJobId(tostring(d.server.job_id)) end
+      if not pid and d.server.place_id then pid = tonumber(d.server.place_id) end
+      if jid then return jid, pid end
+    end
   end
+  -- Fallback: choose highest value from /servers
+  local ok2, res2 = pcall(function() return http_call({ Url = API.."/servers", Method = "GET" }) end)
+  if ok2 and res2 and res2.StatusCode == 200 and res2.Body then
+    local d2 = jsonDecode(res2.Body)
+    if d2 and d2.servers and type(d2.servers) == "table" then
+      local best = nil
+      for _, it in ipairs(d2.servers) do
+        local nm = tostring(it.pet_name or "")
+        local val = tonumber(it.value or 0) or 0
+        if not (blacklistOn and inBlacklist(nm)) and (not string.find(string.lower(nm), "brainrot notify")) then
+          if not minOn or val >= (state.min_money_raw * 1e6) then
+            if (not best) or (val > (tonumber(best.value or 0) or 0)) then best = it end
+          end
+        end
+      end
+      if best then
+        local jid, pid = nil, nil
+        if best.join_script then jid, pid = parseJoinScript(best.join_script) end
+        if not jid and best.job_id then jid = normalizeJobId(tostring(best.job_id)) end
+        if not pid and best.place_id then pid = tonumber(best.place_id) end
+        if jid then return jid, pid end
+      end
+    end
+  end
+  -- Last resort: text endpoint then pollNext
+  local tjid = turboNextText()
+  if tjid then return tjid, nil end
+  return pollNext()
 end
 
 -- Minimal UI (executor-native), avoid heavy libraries; pcall sections for robustness
@@ -118,8 +204,8 @@ local orange = Color3.fromRGB(214,130,46)
 
 -- Root floating panel like screenshot
 local Root = Instance.new("Frame")
-Root.Size = UDim2.new(0, 780, 0, 380)
-Root.Position = UDim2.new(0.5, -390, 0.5, -190)
+Root.Size = UDim2.new(0, 820, 0, 520)
+Root.Position = UDim2.new(0.5, -410, 0.5, -260)
 Root.BackgroundColor3 = gray
 Root.BorderSizePixel = 0
 Root.Active = true
@@ -205,6 +291,51 @@ autoLabel.TextXAlignment = Enum.TextXAlignment.Left
 autoLabel.Text = "AUTO JOIN: OFF"
 autoLabel.Parent = Left
 
+-- Money filter label and controls
+local minLabel = Instance.new("TextLabel")
+minLabel.BackgroundTransparency = 1
+minLabel.Position = UDim2.new(0, 16, 0, 86)
+minLabel.Size = UDim2.new(0, 240, 0, 20)
+minLabel.Font = Enum.Font.Gotham
+minLabel.TextSize = 14
+minLabel.TextColor3 = Color3.fromRGB(200,200,200)
+minLabel.TextXAlignment = Enum.TextXAlignment.Left
+minLabel.Text = "MIN: 0M"
+minLabel.Parent = Left
+
+local mfToggle = Instance.new("TextButton")
+mfToggle.Size = UDim2.new(0, 120, 0, 22)
+mfToggle.Position = UDim2.new(0, 16, 0, 110)
+mfToggle.BackgroundColor3 = Color3.fromRGB(90,90,90)
+mfToggle.BorderSizePixel = 0
+mfToggle.TextColor3 = Color3.fromRGB(255,255,255)
+mfToggle.Font = Enum.Font.GothamBold
+mfToggle.TextSize = 13
+mfToggle.Text = "FILTER: OFF"
+mfToggle.Parent = Left
+
+local minusBtn = Instance.new("TextButton")
+minusBtn.Size = UDim2.new(0, 28, 0, 22)
+minusBtn.Position = UDim2.new(0, 182, 0, 86)
+minusBtn.BackgroundColor3 = Color3.fromRGB(120,120,120)
+minusBtn.BorderSizePixel = 0
+minusBtn.TextColor3 = Color3.fromRGB(255,255,255)
+minusBtn.Font = Enum.Font.GothamBold
+minusBtn.TextSize = 14
+minusBtn.Text = "-"
+minusBtn.Parent = Left
+
+local plusBtn = Instance.new("TextButton")
+plusBtn.Size = UDim2.new(0, 28, 0, 22)
+plusBtn.Position = UDim2.new(0, 214, 0, 86)
+plusBtn.BackgroundColor3 = Color3.fromRGB(120,120,120)
+plusBtn.BorderSizePixel = 0
+plusBtn.TextColor3 = Color3.fromRGB(255,255,255)
+plusBtn.Font = Enum.Font.GothamBold
+plusBtn.TextSize = 14
+plusBtn.Text = "+"
+plusBtn.Parent = Left
+
 local blacklistLabel = Instance.new("TextLabel")
 blacklistLabel.BackgroundTransparency = 1
 blacklistLabel.Position = UDim2.new(0, 16, 0, 102)
@@ -254,7 +385,7 @@ purgeBtn.Size = UDim2.new(0, 240, 0, 28)
 
 local blChipScroll = Instance.new("ScrollingFrame")
 blChipScroll.Position = UDim2.new(0, 16, 0, 354)
-blChipScroll.Size = UDim2.new(0, 240, 0, 54)
+blChipScroll.Size = UDim2.new(0, 240, 0, 120)
 blChipScroll.BackgroundColor3 = gray3
 blChipScroll.BorderSizePixel = 0
 blChipScroll.ScrollBarThickness = 6
@@ -384,6 +515,29 @@ local function setAuto(on)
   autoLabel.Text = on and "AUTO JOIN: ON" or "AUTO JOIN: OFF"
 end
 
+local function setMinRaw(m)
+  local mnum = tonumber(m) or 0
+  if mnum < 0 then mnum = 0 end
+  state.min_money_raw = mnum
+  minLabel.Text = "MIN: "..tostring(mnum).."M"
+end
+
+local function setFilterOn(on)
+  if on then
+    if (tonumber(state.min_money_raw) or 0) <= 0 then
+      if _min_last <= 0 then _min_last = 5 end
+      setMinRaw(_min_last)
+    end
+    mfToggle.Text = "FILTER: ON"
+    mfToggle.BackgroundColor3 = green
+  else
+    _min_last = tonumber(state.min_money_raw) or 0
+    setMinRaw(0)
+    mfToggle.Text = "FILTER: OFF"
+    mfToggle.BackgroundColor3 = Color3.fromRGB(90,90,90)
+  end
+end
+
 local heartbeat
 local _lastPost = 0
 local _blVersion = 0
@@ -405,26 +559,29 @@ local function start()
       _lastPost = nowt
       local bl = {}
       for name, on in pairs(state.blacklist) do if on then table.insert(bl, name) end end
-      local json
-      if _blVersion == 0 then
-        json = HttpService:JSONEncode({ blacklist = bl })
-        _blJsonCache = json
-      else
-        json = _blJsonCache
-      end
+      local body = HttpService:JSONEncode({ blacklist = bl, min_money = (tonumber(state.min_money_raw) or 0) * 1000000 })
       local ok, res = pcall(function()
-        return http_call({Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json })
+        return http_call({Url = API.."/next", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
       end)
-      local jid
+      local jid, pid
       if ok and res and (res.StatusCode == 200 or res.StatusCode == 201) and res.Body then
         local data = jsonDecode(res.Body)
-        if data and data.ok and data.server and data.server.job_id then
-          jid = tostring(data.server.job_id)
+        if data and data.ok and data.server then
+          if data.server.join_script then
+            jid, pid = parseJoinScript(data.server.join_script)
+          end
+          if not jid and data.server.job_id then
+            jid = normalizeJobId(tostring(data.server.job_id))
+          end
+          if not pid and data.server.place_id then
+            pid = tonumber(data.server.place_id)
+          end
         end
       end
       if jid and jid ~= state.lastJob then
         state.lastJob = jid
-        teleport(jid)
+        showJoinInfo({ source = "Auto" }, jid, pid)
+        teleport(jid, pid)
       end
     end
   end)
@@ -441,8 +598,34 @@ stopBtn.MouseButton1Click:Connect(function()
 end)
 
 turboBtn.MouseButton1Click:Connect(function()
-  local jid = turboNextText() or pollNext()
-  if jid then teleport(jid) end
+  local jid, pid = turboGetJobId()
+  if jid then
+    showJoinInfo({ source = "Turbo" }, jid, pid)
+    teleport(jid, pid)
+  end
+end)
+
+-- Right header quick button: JOIN LATEST
+local joinLatestBtnR = Instance.new("TextButton")
+joinLatestBtnR.Size = UDim2.new(0, 120, 0, 28)
+joinLatestBtnR.Position = UDim2.new(1, -136, 0, 8)
+joinLatestBtnR.BackgroundColor3 = Color3.fromRGB(160,100,220)
+joinLatestBtnR.BorderSizePixel = 0
+joinLatestBtnR.TextColor3 = Color3.fromRGB(255,255,255)
+joinLatestBtnR.Font = Enum.Font.GothamBold
+joinLatestBtnR.TextSize = 14
+joinLatestBtnR.Text = "JOIN LATEST"
+joinLatestBtnR.Parent = Right
+joinLatestBtnR.MouseButton1Click:Connect(function()
+  local jid, pid = turboGetJobId()
+  if jid then
+    -- spam teleport a few times for reliability
+    local tries = 3
+    showJoinInfo({ source = "Join Latest" }, jid, pid)
+    task.spawn(function()
+      for i=1,tries do teleport(jid, pid) task.wait(0.15) end
+    end)
+  end
 end)
 
 local function setclipboard_any(text)
@@ -457,6 +640,40 @@ local function showToast(msg)
   toast.Text = msg
   toast.Visible = true
   task.delay(1.5, function() toast.Visible = false end)
+end
+
+-- Helpers to show which server we're joining
+local function fmtMoney(v)
+  local n = tonumber(v or 0) or 0
+  if n <= 0 then return "--" end
+  return "$"..string.format("%.1f", n/1e6).."M/s"
+end
+
+local function shortJob(j)
+  j = tostring(j or "")
+  if #j <= 8 then return j end
+  return string.sub(j, 1, 8).."…"
+end
+
+local function showJoinInfo(meta, jid, pid)
+  local name = meta and meta.pet_name or nil
+  local val = meta and meta.value or nil
+  local src = meta and meta.source or nil
+  local money = fmtMoney(val)
+  local parts = {}
+  if name and #tostring(name) > 0 then table.insert(parts, tostring(name)) end
+  if money ~= "--" then table.insert(parts, money) end
+  local info = table.concat(parts, "  –  ")
+  if #info == 0 then
+    info = (pid and ("place "..tostring(pid)) or "")
+    if #info > 0 then info = info .. " • " end
+    info = info .. "job " .. shortJob(jid or "")
+  end
+  if src and #src > 0 then
+    showToast("Joining: "..info.."  ("..src..")")
+  else
+    showToast("Joining: "..info)
+  end
 end
 
 -- Invi (local base invisibility) toggle
@@ -539,8 +756,30 @@ UIS.InputBegan:Connect(function(input, gp)
   elseif input.KeyCode == Enum.KeyCode.R then
     -- Config placeholder: future settings
   elseif input.KeyCode == Enum.KeyCode.J then
-    local jid = turboGetJobId()
-    if jid then teleport(jid) end
+    local jid, pid = turboGetJobId()
+    if jid then
+      showJoinInfo({ source = "J Key" }, jid, pid)
+      teleport(jid, pid)
+    end
+  elseif input.KeyCode == Enum.KeyCode.M then
+    -- cycle 0 -> 5 -> 10 -> 20 -> 50 -> 0
+    local cur = tonumber(state.min_money_raw) or 0
+    local nextv = 0
+    if cur < 5 then nextv = 5 elseif cur < 10 then nextv = 10 elseif cur < 20 then nextv = 20 elseif cur < 50 then nextv = 50 else nextv = 0 end
+    setFilterOn(nextv > 0)
+    setMinRaw(nextv)
+    showToast("Money filter: "..tostring(state.min_money_raw).."M+")
+  elseif input.KeyCode == Enum.KeyCode.LeftBracket then
+    local v = (tonumber(state.min_money_raw) or 0) - 5
+    if v < 0 then v = 0 end
+    setFilterOn(v > 0)
+    setMinRaw(v)
+    showToast("Money filter: "..tostring(state.min_money_raw).."M+")
+  elseif input.KeyCode == Enum.KeyCode.RightBracket then
+    local v = (tonumber(state.min_money_raw) or 0) + 5
+    setFilterOn(v > 0)
+    setMinRaw(v)
+    showToast("Money filter: "..tostring(state.min_money_raw).."M+")
   end
 end)
 
@@ -655,6 +894,26 @@ purgeBtn.MouseButton1Click:Connect(function()
   pcall(function() return http_call({ Url = API.."/purge", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = _blJsonCache }) end)
 end)
 
+-- Wire Money Filter buttons
+mfToggle.MouseButton1Click:Connect(function()
+  local on = (tonumber(state.min_money_raw) or 0) <= 0
+  setFilterOn(on)
+  showToast(on and ("Money filter: "..tostring(state.min_money_raw).."M+") or "Money filter: OFF")
+end)
+minusBtn.MouseButton1Click:Connect(function()
+  local v = (tonumber(state.min_money_raw) or 0) - 5
+  if v < 0 then v = 0 end
+  setMinRaw(v)
+  if v <= 0 then setFilterOn(false) else setFilterOn(true) end
+  showToast("Money filter: "..tostring(state.min_money_raw).."M+")
+end)
+plusBtn.MouseButton1Click:Connect(function()
+  local v = (tonumber(state.min_money_raw) or 0) + 5
+  setMinRaw(v)
+  if v <= 0 then setFilterOn(false) else setFilterOn(true) end
+  showToast("Money filter: "..tostring(state.min_money_raw).."M+")
+end)
+
 -- Make rows from /servers queue info
 local function makeRow(info)
   local row = Instance.new("Frame")
@@ -701,7 +960,14 @@ local function makeRow(info)
   join.Text = "JOIN"
   join.Parent = row
   join.MouseButton1Click:Connect(function()
-    teleport(tostring(info.job_id or ""))
+    local jid, pid = nil, nil
+    if info.join_script then jid, pid = parseJoinScript(info.join_script) end
+    if not jid and info.job_id then jid = normalizeJobId(tostring(info.job_id)) end
+    if not pid and info.place_id then pid = tonumber(info.place_id) end
+    if jid then
+      showJoinInfo({ pet_name = info.pet_name, value = info.value, source = "List" }, jid, pid)
+      teleport(jid, pid)
+    end
   end)
 
   -- double-click row to join quickly
@@ -710,7 +976,14 @@ local function makeRow(info)
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
       local now = tick()
       if now - lastClick < 0.25 then
-        teleport(tostring(info.job_id or ""))
+        local jid, pid = nil, nil
+        if info.join_script then jid, pid = parseJoinScript(info.join_script) end
+        if not jid and info.job_id then jid = normalizeJobId(tostring(info.job_id)) end
+        if not pid and info.place_id then pid = tonumber(info.place_id) end
+        if jid then
+          showJoinInfo({ pet_name = info.pet_name, value = info.value, source = "Double-Click" }, jid, pid)
+          teleport(jid, pid)
+        end
       end
       lastClick = now
     end
@@ -790,6 +1063,32 @@ task.spawn(function()
   while true do
     task.wait(1.0)
     refreshList()
+  end
+end)
+
+-- Command bridge polling: react to desktop log actions
+task.spawn(function()
+  while true do
+    task.wait(0.25)
+    local ok,res = pcall(function() return http_call({ Url = API.."/command", Method = "GET" }) end)
+    if ok and res and res.StatusCode == 200 and res.Body then
+      local d = jsonDecode(res.Body)
+      if d and d.ok and not d.empty then
+        local cmd = d.command or {}
+        local act = string.lower(tostring(cmd.action or ""))
+        if act == "join" and cmd.job_id then
+          local jid = normalizeJobId(tostring(cmd.job_id))
+          -- spam teleport a few times for reliability
+          showJoinInfo({ source = "Desktop" }, jid, nil)
+          task.spawn(function() for i=1,3 do teleport(jid) task.wait(0.15) end end)
+        elseif act == "blacklist" and cmd.name then
+          addBlacklist(tostring(cmd.name))
+          rebuildBlacklist(); renderBlacklistChips()
+          -- Optionally purge server queue to remove blacklisted
+          pcall(function() return http_call({ Url = API.."/purge", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = _blJsonCache }) end)
+        end
+      end
+    end
   end
 end)
 
