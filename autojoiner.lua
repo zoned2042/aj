@@ -40,6 +40,17 @@ local showJoinInfo
 local inBlacklist
 local blacklistOn = true
 
+-- Early safe implementation so callers (turboGetJobId, etc.) never call nil
+inBlacklist = function(name)
+  local nm = string.lower(tostring(name or ""))
+  for term, on in pairs(state.blacklist) do
+    if on and string.find(nm, string.lower(tostring(term)), 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
 local function jsonDecode(s)
   local ok, data = pcall(function() return HttpService:JSONDecode(s) end)
   if ok then return data end
@@ -168,7 +179,8 @@ local function turboGetJobId()
       for _, it in ipairs(d2.servers) do
         local nm = tostring(it.pet_name or "")
         local val = tonumber(it.value or 0) or 0
-        if not (blacklistOn and inBlacklist(nm)) and (not string.find(string.lower(nm), "brainrot notify")) then
+  local isBlk = (type(inBlacklist) == "function") and inBlacklist(nm) or false
+  if not (blacklistOn and isBlk) and (not string.find(string.lower(nm), "brainrot notify")) then
           if not minOn or val >= (state.min_money_raw * 1e6) then
             if (not best) or (val > (tonumber(best.value or 0) or 0)) then best = it end
           end
@@ -242,8 +254,8 @@ local orange = Color3.fromRGB(214,130,46)
 
 -- Root floating panel like screenshot
 local Root = Instance.new("Frame")
-Root.Size = UDim2.new(0, 820, 0, 520)
-Root.Position = UDim2.new(0.5, -410, 0.5, -260)
+Root.Size = UDim2.new(0, 980, 0, 560)
+Root.Position = UDim2.new(0.5, -490, 0.5, -280)
 Root.BackgroundColor3 = gray
 Root.BorderSizePixel = 0
 Root.Active = true
@@ -315,12 +327,13 @@ local function makeBtn(parent, text, bg, pos)
 end
 
 local runningBtn = makeBtn(Left, "START", green, UDim2.new(0, 16, 0, 16))
-local stopBtn = makeBtn(Left, "STOP", red, UDim2.new(0, 146, 0, 16))
+-- Stop under Start to avoid cramming
+local stopBtn = makeBtn(Left, "STOP", red, UDim2.new(0, 16, 0, 56))
 local turboBtn = makeBtn(Left, "TURBO [J]", Color3.fromRGB(200,120,60), UDim2.new(0, 16, 0, 170))
 
 local autoLabel = Instance.new("TextLabel")
 autoLabel.BackgroundTransparency = 1
-autoLabel.Position = UDim2.new(0, 16, 0, 66)
+autoLabel.Position = UDim2.new(0, 16, 0, 96)
 autoLabel.Size = UDim2.new(0, 240, 0, 24)
 autoLabel.Font = Enum.Font.Gotham
 autoLabel.TextSize = 14
@@ -332,7 +345,7 @@ autoLabel.Parent = Left
 -- Money filter label and controls
 local minLabel = Instance.new("TextLabel")
 minLabel.BackgroundTransparency = 1
-minLabel.Position = UDim2.new(0, 16, 0, 86)
+minLabel.Position = UDim2.new(0, 16, 0, 116)
 minLabel.Size = UDim2.new(0, 240, 0, 20)
 minLabel.Font = Enum.Font.Gotham
 minLabel.TextSize = 14
@@ -343,7 +356,7 @@ minLabel.Parent = Left
 
 local mfToggle = Instance.new("TextButton")
 mfToggle.Size = UDim2.new(0, 120, 0, 22)
-mfToggle.Position = UDim2.new(0, 16, 0, 110)
+mfToggle.Position = UDim2.new(0, 16, 0, 140)
 mfToggle.BackgroundColor3 = Color3.fromRGB(90,90,90)
 mfToggle.BorderSizePixel = 0
 mfToggle.TextColor3 = Color3.fromRGB(255,255,255)
@@ -354,7 +367,7 @@ mfToggle.Parent = Left
 
 local minusBtn = Instance.new("TextButton")
 minusBtn.Size = UDim2.new(0, 28, 0, 22)
-minusBtn.Position = UDim2.new(0, 182, 0, 86)
+minusBtn.Position = UDim2.new(0, 182, 0, 116)
 minusBtn.BackgroundColor3 = Color3.fromRGB(120,120,120)
 minusBtn.BorderSizePixel = 0
 minusBtn.TextColor3 = Color3.fromRGB(255,255,255)
@@ -365,7 +378,7 @@ minusBtn.Parent = Left
 
 local plusBtn = Instance.new("TextButton")
 plusBtn.Size = UDim2.new(0, 28, 0, 22)
-plusBtn.Position = UDim2.new(0, 214, 0, 86)
+plusBtn.Position = UDim2.new(0, 214, 0, 116)
 plusBtn.BackgroundColor3 = Color3.fromRGB(120,120,120)
 plusBtn.BorderSizePixel = 0
 plusBtn.TextColor3 = Color3.fromRGB(255,255,255)
@@ -376,7 +389,7 @@ plusBtn.Parent = Left
 
 local blacklistLabel = Instance.new("TextLabel")
 blacklistLabel.BackgroundTransparency = 1
-blacklistLabel.Position = UDim2.new(0, 16, 0, 102)
+blacklistLabel.Position = UDim2.new(0, 16, 0, 142)
 blacklistLabel.Size = UDim2.new(0, 240, 0, 20)
 blacklistLabel.Font = Enum.Font.Gotham
 blacklistLabel.TextSize = 14
@@ -385,14 +398,14 @@ blacklistLabel.TextXAlignment = Enum.TextXAlignment.Left
 blacklistLabel.Text = "BLACKLIST"
 blacklistLabel.Parent = Left
 
-local blToggle = makeBtn(Left, "BLACKLIST ON", green, UDim2.new(0, 16, 0, 126))
+local blToggle = makeBtn(Left, "BLACKLIST ON", green, UDim2.new(0, 16, 0, 166))
 
-local inviBtn = makeBtn(Left, "INVI: OFF [H]", Color3.fromRGB(68,114,196), UDim2.new(0, 16, 0, 214))
+local inviBtn = makeBtn(Left, "INVI: OFF [H]", Color3.fromRGB(68,114,196), UDim2.new(0, 16, 0, 254))
 
 -- Brainrot blacklist box
 local blListLabel = Instance.new("TextLabel")
 blListLabel.BackgroundTransparency = 1
-blListLabel.Position = UDim2.new(0, 16, 0, 254)
+blListLabel.Position = UDim2.new(0, 16, 0, 294)
 blListLabel.Size = UDim2.new(0, 240, 0, 20)
 blListLabel.Font = Enum.Font.Gotham
 blListLabel.TextSize = 14
@@ -403,7 +416,7 @@ blListLabel.Parent = Left
 
 -- Input box + ADD + PURGE
 local blInput = Instance.new("TextBox")
-blInput.Position = UDim2.new(0, 16, 0, 278)
+blInput.Position = UDim2.new(0, 16, 0, 318)
 blInput.Size = UDim2.new(0, 160, 0, 28)
 blInput.BackgroundColor3 = gray3
 blInput.BorderSizePixel = 0
@@ -415,14 +428,14 @@ blInput.Font = Enum.Font.Gotham
 blInput.TextSize = 14
 blInput.Parent = Left
 
-local blAddBtn = makeBtn(Left, "ADD", Color3.fromRGB(90,140,220), UDim2.new(0, 182, 0, 278))
+local blAddBtn = makeBtn(Left, "ADD", Color3.fromRGB(90,140,220), UDim2.new(0, 182, 0, 318))
 blAddBtn.Size = UDim2.new(0, 74, 0, 28)
 
-local purgeBtn = makeBtn(Left, "PURGE BLACKLISTED", Color3.fromRGB(120,60,60), UDim2.new(0, 16, 0, 318))
+local purgeBtn = makeBtn(Left, "PURGE BLACKLISTED", Color3.fromRGB(120,60,60), UDim2.new(0, 16, 0, 358))
 purgeBtn.Size = UDim2.new(0, 240, 0, 28)
 
 local blChipScroll = Instance.new("ScrollingFrame")
-blChipScroll.Position = UDim2.new(0, 16, 0, 354)
+blChipScroll.Position = UDim2.new(0, 16, 0, 394)
 blChipScroll.Size = UDim2.new(0, 240, 0, 120)
 blChipScroll.BackgroundColor3 = gray3
 blChipScroll.BorderSizePixel = 0
@@ -482,8 +495,28 @@ local function headerText(txt, x)
   l.Parent = rowHeader
 end
 headerText("PET", 12)
-headerText("MONEY/s", 350)
-headerText("ACTION", 500)
+-- Scaled headers for right-aligned columns
+local moneyHead = Instance.new("TextLabel")
+moneyHead.BackgroundTransparency = 1
+moneyHead.Position = UDim2.new(0.72, 0, 0, 7)
+moneyHead.Size = UDim2.new(0, 120, 0, 20)
+moneyHead.Font = Enum.Font.GothamBold
+moneyHead.TextSize = 14
+moneyHead.TextColor3 = Color3.fromRGB(220,220,220)
+moneyHead.TextXAlignment = Enum.TextXAlignment.Left
+moneyHead.Text = "MONEY/s"
+moneyHead.Parent = rowHeader
+
+local actionHead = Instance.new("TextLabel")
+actionHead.BackgroundTransparency = 1
+actionHead.Position = UDim2.new(1, -96, 0, 7)
+actionHead.Size = UDim2.new(0, 90, 0, 20)
+actionHead.Font = Enum.Font.GothamBold
+actionHead.TextSize = 14
+actionHead.TextColor3 = Color3.fromRGB(220,220,220)
+actionHead.TextXAlignment = Enum.TextXAlignment.Left
+actionHead.Text = "ACTION"
+actionHead.Parent = rowHeader
 
 -- Multi Pets boxed panel (hidden unless tab is active)
 local mpBox = Instance.new("Frame")
@@ -829,7 +862,7 @@ UIS.InputBegan:Connect(function(input, gp)
 end)
 
 -- blacklist feature (client-side)
-local blacklistOn = true
+blacklistOn = true
 local blacklist = {}
 local function addBlacklist(name)
   if not name then return end
@@ -837,7 +870,7 @@ local function addBlacklist(name)
   if #name == 0 then return end
   blacklist[name] = true
 end
-local function inBlacklist(name)
+inBlacklist = function(name)
   if not name then return false end
   return blacklist[string.lower(name)] == true
 end
@@ -981,8 +1014,8 @@ local function makeRow(info)
 
   local money = Instance.new("TextLabel")
   money.BackgroundTransparency = 1
-  money.Position = UDim2.new(0, 350, 0, 10)
-  money.Size = UDim2.new(0, 100, 0, 20)
+  money.Position = UDim2.new(0, 420, 0, 10)
+  money.Size = UDim2.new(0, 140, 0, 20)
   money.Font = Enum.Font.GothamBold
   money.TextSize = 14
   money.TextColor3 = Color3.fromRGB(50,220,140)
@@ -995,8 +1028,9 @@ local function makeRow(info)
   money.Parent = row
 
   local join = Instance.new("TextButton")
-  join.Size = UDim2.new(0, 90, 0, 28)
-  join.Position = UDim2.new(0, 500, 0, 6)
+  join.Size = UDim2.new(0, 100, 0, 28)
+  -- anchor to right with margin
+  join.Position = UDim2.new(1, -116, 0, 6)
   join.BackgroundColor3 = Color3.fromRGB(200,60,60)
   join.BorderSizePixel = 0
   join.TextColor3 = Color3.fromRGB(255,255,255)
@@ -1050,7 +1084,8 @@ local function refreshList()
       local count = 0
       for _, info in ipairs(items) do
         local nm = tostring(info.pet_name or "")
-        if not (blacklistOn and inBlacklist(nm)) and (not string.find(string.lower(nm), "brainrot notify")) then
+  local isBlk2 = (type(inBlacklist) == "function") and inBlacklist(nm) or false
+  if not (blacklistOn and isBlk2) and (not string.find(string.lower(nm), "brainrot notify")) then
           local row = makeRow(info)
           row.Parent = Scroller
           count += 1
