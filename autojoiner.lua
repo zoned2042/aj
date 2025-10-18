@@ -50,27 +50,41 @@ end
 local function normalizeJobId(id)
   if not id then return nil end
   local s = tostring(id)
-  -- strip whitespace and quotes
-  s = s:gsub("[\r\n\t]", " "):gsub("%s+", ""):gsub("^[\'\"]+", ""):gsub("[\'\"]+$", "")
+  -- strip whitespace and quotes (avoid bracket classes for strict executors)
+  s = s:gsub("\r", " "):gsub("\n", " "):gsub("\t", " ")
+  s = s:gsub("%s+", "")
+  s = s:gsub("^[\"']+", ""):gsub("[\"']+$", "")
   if #s < 32 or #s > 64 then return nil end
-  if not s:match("^[0-9a-fA-F%-]+$") then return nil end
   if not s:find("%-") then return nil end
+  -- ensure only hex digits and hyphens
+  for i = 1, #s do
+    local ch = s:sub(i, i)
+    local isHex = ch:match("%x") ~= nil
+    if (not isHex) and ch ~= '-' then return nil end
+  end
   return s
 end
 
 -- Attempt to parse placeId and jobId from a join_script string
 local function parseJoinScript(js)
   if type(js) ~= "string" or #js == 0 then return nil, nil end
-  -- Pattern: TeleportService:TeleportToPlaceInstance(123456, "guid")
-  -- Use long-bracket strings to avoid escaping issues in some executors.
-  local pid, jid = js:match([[TeleportToPlaceInstance%(%s*(%d+)%s*,%s*["']([0-9A-Fa-f%-]+)["']]])
+  -- Make parsing quote-agnostic to avoid executor parser quirks: drop all quotes first.
+  local s = tostring(js):gsub('"', ""):gsub("'", "")
+  -- GUID-ish pattern without []: groups of hex separated by '-' (roblox JobId is a GUID)
+  local GUID = "%x+%-%x+%-%x+%-%x+%-%x+"
+  -- Primary: TeleportService:TeleportToPlaceInstance(placeId, jobId)
+  local pid, jid = s:match("TeleportService:%s*TeleportToPlaceInstance%(%s*(%d+)%s*,%s*("..GUID..")%s*%)")
   if not pid or not jid then
-    -- Fallback: placeId=12345 ... jobId="..."
-    pid, jid = js:match([[placeId%s*=%s*(%d+).-[jJ]ob[Ii]d%s*=%s*["']([0-9A-Fa-f%-]+)["']]])
+    -- Also allow without explicit service qualifier
+    pid, jid = s:match("TeleportToPlaceInstance%(%s*(%d+)%s*,%s*("..GUID..")%s*%)")
   end
   if not pid or not jid then
-    -- Last resort: a number then a GUID-like token in quotes
-    local p2, j2 = js:match([[ (%d+).-["']([0-9A-Fa-f%-]+)["'] ]])
+    -- Fallback: placeId=12345 ... jobId=GUID
+    pid, jid = s:match("placeId%s*=%s*(%d+).-[jJ]ob[Ii]d%s*=%s*("..GUID..")")
+  end
+  if not pid or not jid then
+    -- Last resort: first number then a GUID-like token later in the string
+    local p2, j2 = s:match("(%d+).-("..GUID..")")
     if p2 and j2 then pid, jid = p2, j2 end
   end
   local njid = normalizeJobId(jid)
@@ -183,16 +197,39 @@ ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
+-- Prefer PlayerGui for visibility if _G.VAULT_PREFER_PLAYERGUI is set.
 local function protect_gui(gui)
   pcall(function()
     if syn and syn.protect_gui then syn.protect_gui(gui) end
   end)
-  local parent = (gethui and gethui())
-    or (get_hidden_gui and get_hidden_gui())
-    or (game:FindFirstChildOfClass("CoreGui"))
-    or game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
-    or game:GetService("StarterGui")
+  local lp = Players.LocalPlayer
+  local playerGui = lp and (lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui"))
+
+  local parent = nil
+  if _G and _G.VAULT_PREFER_PLAYERGUI then
+    parent = playerGui
+  else
+    -- Some executors expose gethui/get_hidden_gui that render UI, but in others it's invisible.
+    -- We'll try them only if the flag isn't set; otherwise we force PlayerGui above.
+    if gethui then
+      local ok, res = pcall(gethui)
+      if ok and typeof(res) == "Instance" then parent = res end
+    end
+    if not parent and get_hidden_gui then
+      local ok, res = pcall(get_hidden_gui)
+      if ok and typeof(res) == "Instance" then parent = res end
+    end
+    if not parent then parent = game:FindFirstChildOfClass("CoreGui") end
+    if not parent then parent = playerGui end
+  end
+  if not parent then parent = game:GetService("StarterGui") end
   gui.Parent = parent
+  -- Safety: if UI isn't visible after a short delay, force to PlayerGui
+  task.delay(0.5, function()
+    if gui and gui.Parent and playerGui and not gui:IsDescendantOf(playerGui) then
+      pcall(function() gui.Parent = playerGui end)
+    end
+  end)
 end
 
 local green = Color3.fromRGB(24,164,99)
@@ -503,6 +540,13 @@ toast.TextColor3 = Color3.fromRGB(200,200,255)
 toast.Font = Enum.Font.Gotham
 toast.TextSize = 14
 toast.Parent = ScreenGui
+
+-- Simple notification helper (best-effort; some executors sandbox SetCore)
+local function notify(title, text)
+  pcall(function()
+    game:GetService("StarterGui"):SetCore("SendNotification", { Title = tostring(title or "Autojoiner"), Text = tostring(text or ""), Duration = 3 })
+  end)
+end
 
 local function setRunning(on)
   state.running = on and true or false
@@ -1101,3 +1145,4 @@ setAuto(false)
 showServersTab()
 
 -- Loader removed: using native UI only; blacklist box replaces loader section
+notify(TITLE, "UI loaded. Hotkeys: [T] auto, [H] invi, [J] turbo, [`] toggle UI")
